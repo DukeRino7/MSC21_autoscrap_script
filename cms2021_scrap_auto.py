@@ -75,6 +75,7 @@ LOOP_SLEEP_SECONDS = 0.001
 COOLDOWN_MS = 220
 HIT_LOCKOUT_SECONDS = 0.65
 VERBOSE_LOGGING = False
+QUIET_MODE = True
 LOG_ONLY_ON_SLOT_CHANGE = True
 LOG_ONLY_ON_HIT = True
 
@@ -97,8 +98,8 @@ ADJACENT_RECHECK_ENABLED = False
 ADJACENT_RECHECK_DELAY_SECONDS = 0.012
 FIRST_HIT_GRACE_SECONDS = 0.20
 FIRST_HIT_DELAY_SECONDS = 0.004
-APPROACH_DELAY_FROM_LEFT_SECONDS = 0.014
-APPROACH_DELAY_FROM_RIGHT_SECONDS = 0.014
+APPROACH_DELAY_FROM_LEFT_SECONDS = 0.016
+APPROACH_DELAY_FROM_RIGHT_SECONDS = 0.016
 
 # Bright cyan/blue target column.
 BLUE_HSV_LOWER = np.array((75, 80, 120), dtype=np.uint8)
@@ -432,7 +433,8 @@ def print_hit_debug(pointer_slot, previous_slot, blue_slot, direction, reason, d
         f"reason={reason}",
         flush=True,
     )
-    print(f"Likely result: {likely_result_text(slot_diff, reason)}", flush=True)
+    if not QUIET_MODE:
+        print(f"Likely result: {likely_result_text(slot_diff, reason)}", flush=True)
 
 
 def update_triangle_motion_debug(triangle_pointer_x):
@@ -452,7 +454,7 @@ def update_triangle_motion_debug(triangle_pointer_x):
         previous_triangle_pointer_x = triangle_pointer_x
 
     warning_ready = now_seconds() - last_pointer_warning_time >= 1.0
-    if stationary_pointer_frames >= POINTER_STATIC_WARNING_FRAMES and warning_ready:
+    if (DEBUG_SAVE_FRAMES or VERBOSE_LOGGING) and stationary_pointer_frames >= POINTER_STATIC_WARNING_FRAMES and warning_ready:
         print("\nWARNING: pointer_x is not moving, detection may be locked onto a static object", flush=True)
         last_pointer_warning_time = now_seconds()
 
@@ -593,14 +595,15 @@ def handle_minigame(blue_rect, triangle_pointer_x, slot_centers, cooldown_ready,
                 exact_hit = True
                 recheck_hit = True
                 hit_reason = "adjacent-recheck"
-        print(
-            "\nADJACENT RECHECK | "
-            f"old_pointer_slot={old_pointer_slot} | "
-            f"new_pointer_slot={recheck_pointer_slot} | "
-            f"blue_slot={recheck_blue_slot} | "
-            f"hit={recheck_hit}",
-            flush=True,
-        )
+        if not QUIET_MODE:
+            print(
+                "\nADJACENT RECHECK | "
+                f"old_pointer_slot={old_pointer_slot} | "
+                f"new_pointer_slot={recheck_pointer_slot} | "
+                f"blue_slot={recheck_blue_slot} | "
+                f"hit={recheck_hit}",
+                flush=True,
+            )
 
     hit_lockout_ready = time.time() - last_hit_time >= HIT_LOCKOUT_SECONDS
     if hit and cooldown_ready and hit_lockout_ready and not hit_sent_for_current_attempt:
