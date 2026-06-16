@@ -73,6 +73,7 @@ AUTO_RESTART_INTERVAL_SECONDS = 0.5
 POST_HIT_DELAY_SECONDS = 0.10
 LOOP_SLEEP_SECONDS = 0.001
 COOLDOWN_MS = 220
+HIT_LOCKOUT_SECONDS = 0.65
 VERBOSE_LOGGING = False
 LOG_ONLY_ON_SLOT_CHANGE = True
 LOG_ONLY_ON_HIT = True
@@ -83,14 +84,21 @@ PREDICTION_SECONDS = 0
 SLOT_COUNT = 20
 BAR_X1 = None
 BAR_X2 = None
-SLOT_TOLERANCE = 0
+SLOT_TOLERANCE = 1
 # If it presses one slot before blue, try SLOT_OFFSET = 1.
 # If it presses one slot after blue, try SLOT_OFFSET = -1.
 SLOT_OFFSET = 0
-CROSSED_BLUE_ENABLED = True
+CROSSED_BLUE_ENABLED = False
 STRICT_SLOT_HIT_MODE = False
+EXACT_HIT_ONLY = False
 WAIT_FOR_EXACT_SLOT_IF_ADJACENT = True
 ADJACENT_SLOT_WAIT_SECONDS = 0.015
+ADJACENT_RECHECK_ENABLED = False
+ADJACENT_RECHECK_DELAY_SECONDS = 0.012
+FIRST_HIT_GRACE_SECONDS = 0.20
+FIRST_HIT_DELAY_SECONDS = 0.004
+APPROACH_DELAY_FROM_LEFT_SECONDS = 0.014
+APPROACH_DELAY_FROM_RIGHT_SECONDS = 0.014
 
 # Bright cyan/blue target column.
 BLUE_HSV_LOWER = np.array((75, 80, 120), dtype=np.uint8)
@@ -144,6 +152,10 @@ previous_pointer_slot = None
 previous_blue_slot = None
 last_pointer_slot_change_time = 0.0
 last_seen_pointer_slot_time = 0.0
+last_hit_time = 0.0
+last_start_time = 0.0
+hit_sent_for_current_attempt = False
+first_hit_pending = False
 
 
 def now_ms():
@@ -194,7 +206,7 @@ def send_space_action(reason):
 
 
 def toggle_automation():
-    global automation_enabled, last_action_time, last_any_detection_time
+    global automation_enabled, last_action_time, last_any_detection_time, hit_sent_for_current_attempt, first_hit_pending, last_start_time
     automation_enabled = not automation_enabled
     state = "ON" if automation_enabled else "OFF"
     print(f"\nF8 pressed: automation {state}")
@@ -203,6 +215,9 @@ def toggle_automation():
         last_any_detection_time = now_seconds()
         if send_space_action("initial-start"):
             last_action_time = now_ms()
+            hit_sent_for_current_attempt = False
+            first_hit_pending = True
+            last_start_time = time.time()
 
 
 def send_manual_space_test():
@@ -388,9 +403,13 @@ def status_print(line):
     last_status_line = line
 
 
-def likely_result_text(slot_diff):
+def likely_result_text(slot_diff, reason=None):
     if slot_diff is None:
         return "unknown"
+    if reason == "approach-left":
+        return "delayed from left"
+    if reason == "approach-right":
+        return "delayed from right"
     if abs(slot_diff) == 0:
         return "exact"
     if slot_diff == -1:
@@ -400,19 +419,20 @@ def likely_result_text(slot_diff):
     return f"off by {slot_diff}"
 
 
-def print_hit_debug(pointer_slot, previous_slot, blue_slot, effective_pointer_slot, crossed_blue, reason):
+def print_hit_debug(pointer_slot, previous_slot, blue_slot, direction, reason, delay):
     slot_diff = None if pointer_slot is None or blue_slot is None else pointer_slot - blue_slot
     print(
         "\nHIT SENT | "
         f"pointer_slot={pointer_slot} | "
         f"previous_pointer_slot={previous_slot} | "
         f"blue_slot={blue_slot} | "
+        f"direction={direction} | "
         f"slot_diff={slot_diff} | "
-        f"crossed_blue={crossed_blue} | "
+        f"delay={delay} | "
         f"reason={reason}",
         flush=True,
     )
-    print(f"Likely result: {likely_result_text(slot_diff)}", flush=True)
+    print(f"Likely result: {likely_result_text(slot_diff, reason)}", flush=True)
 
 
 def update_triangle_motion_debug(triangle_pointer_x):
@@ -491,7 +511,7 @@ def maybe_save_debug_frame(frame, state, blue_rect, triangle_pointer_x, pointer_
 
 
 def handle_minigame(blue_rect, triangle_pointer_x, slot_centers, cooldown_ready, sct=None):
-    global last_action_time, previous_pointer_slot, last_pointer_slot_change_time, last_seen_pointer_slot_time
+    global last_action_time, previous_pointer_slot, last_pointer_slot_change_time, last_seen_pointer_slot_time, last_hit_time, hit_sent_for_current_attempt, first_hit_pending
 
     if blue_rect is None or triangle_pointer_x is None:
         return False, None, previous_pointer_slot, None, None, False, None
@@ -514,30 +534,52 @@ def handle_minigame(blue_rect, triangle_pointer_x, slot_centers, cooldown_ready,
         previous_pointer_slot is not None
         and min(previous_pointer_slot, pointer_slot) <= blue_slot <= max(previous_pointer_slot, pointer_slot)
     )
-    hit = abs(effective_pointer_slot - blue_slot) <= SLOT_TOLERANCE or crossed_blue
-    hit_reason = "exact-slot" if abs(effective_pointer_slot - blue_slot) <= SLOT_TOLERANCE else None
-    if crossed_blue and not hit_reason:
-        hit_reason = "crossed-blue"
+    exact_hit = effective_pointer_slot == blue_slot
+    slot_diff = pointer_slot - blue_slot
+    direction = 0
+    if previous_pointer_slot is not None:
+        if pointer_slot > previous_pointer_slot:
+            direction = 1
+        elif pointer_slot < previous_pointer_slot:
+            direction = -1
+
+    if first_hit_pending and time.time() - last_start_time < FIRST_HIT_GRACE_SECONDS:
+        previous_pointer_slot = pointer_slot
+        return False, pointer_slot, previous_slot_for_debug, blue_slot, effective_pointer_slot, crossed_blue, None
+
+    hit = False
+    hit_reason = None
+    hit_delay = 0.0
+    if exact_hit:
+        hit = True
+        hit_reason = "exact-slot"
+    elif pointer_slot == blue_slot - 1 and direction == 1:
+        hit = True
+        hit_reason = "approach-left"
+        hit_delay = APPROACH_DELAY_FROM_LEFT_SECONDS
+    elif pointer_slot == blue_slot + 1 and direction == -1:
+        hit = True
+        hit_reason = "approach-right"
+        hit_delay = APPROACH_DELAY_FROM_RIGHT_SECONDS
 
     adjacent = abs(pointer_slot - blue_slot) == 1
-    moving_toward_blue = (
-        previous_pointer_slot is not None
-        and abs(pointer_slot - blue_slot) < abs(previous_pointer_slot - blue_slot)
-    )
     if (
         not hit
         and not STRICT_SLOT_HIT_MODE
-        and WAIT_FOR_EXACT_SLOT_IF_ADJACENT
+        and ADJACENT_RECHECK_ENABLED
         and adjacent
-        and moving_toward_blue
         and cooldown_ready
         and sct is not None
     ):
-        time.sleep(ADJACENT_SLOT_WAIT_SECONDS)
+        old_pointer_slot = pointer_slot
+        time.sleep(ADJACENT_RECHECK_DELAY_SECONDS)
         recheck_frame = capture_region(sct)
         recheck_blue_rect, _, _ = detect_blue_target(recheck_frame)
         recheck_pointer_x, _, _ = detect_pointer_triangle(recheck_frame)
         recheck_slot_centers = detect_slot_centers(recheck_frame)
+        recheck_hit = False
+        recheck_pointer_slot = None
+        recheck_blue_slot = blue_slot
         if recheck_blue_rect is not None and recheck_pointer_x is not None and recheck_slot_centers is not None:
             recheck_blue_x1, _, recheck_blue_x2, _ = recheck_blue_rect
             recheck_blue_center_x = recheck_blue_x1 + (recheck_blue_x2 - recheck_blue_x1) / 2.0
@@ -548,12 +590,28 @@ def handle_minigame(blue_rect, triangle_pointer_x, slot_centers, cooldown_ready,
                 blue_slot = recheck_blue_slot
                 effective_pointer_slot = pointer_slot + SLOT_OFFSET
                 hit = True
+                exact_hit = True
+                recheck_hit = True
                 hit_reason = "adjacent-recheck"
+        print(
+            "\nADJACENT RECHECK | "
+            f"old_pointer_slot={old_pointer_slot} | "
+            f"new_pointer_slot={recheck_pointer_slot} | "
+            f"blue_slot={recheck_blue_slot} | "
+            f"hit={recheck_hit}",
+            flush=True,
+        )
 
-    if hit and cooldown_ready:
+    hit_lockout_ready = time.time() - last_hit_time >= HIT_LOCKOUT_SECONDS
+    if hit and cooldown_ready and hit_lockout_ready and not hit_sent_for_current_attempt:
+        if hit_delay > 0:
+            time.sleep(hit_delay)
         if send_space_action("blue-target-hit"):
             last_action_time = now_ms()
-            print_hit_debug(pointer_slot, previous_slot_for_debug, blue_slot, effective_pointer_slot, crossed_blue, hit_reason)
+            last_hit_time = time.time()
+            hit_sent_for_current_attempt = True
+            first_hit_pending = False
+            print_hit_debug(pointer_slot, previous_slot_for_debug, blue_slot, direction, hit_reason, hit_delay)
             time.sleep(POST_HIT_DELAY_SECONDS)
 
     previous_pointer_slot = pointer_slot
@@ -561,7 +619,7 @@ def handle_minigame(blue_rect, triangle_pointer_x, slot_centers, cooldown_ready,
 
 
 def main():
-    global last_action_time, last_any_detection_time, previous_blue_slot
+    global last_action_time, last_any_detection_time, previous_blue_slot, last_hit_time, hit_sent_for_current_attempt, first_hit_pending, last_start_time
 
     validate_region()
     if pydirectinput is None:
@@ -625,20 +683,20 @@ def main():
                     and triangle_pointer_x is None
                     and no_detection_for >= AUTO_RESTART_INTERVAL_SECONDS
                     and cooldown_ready
+                    and time.time() - last_hit_time >= HIT_LOCKOUT_SECONDS
                 )
                 if should_auto_restart:
                     if send_space_action("auto-restart"):
                         last_action_time = now_ms()
+                        hit_sent_for_current_attempt = False
+                        first_hit_pending = True
+                        last_start_time = time.time()
                     time.sleep(START_DELAY_SECONDS)
                     last_any_detection_time = now_seconds()
 
                 pointer_slot_changed = pointer_slot is not None and pointer_slot != previous_slot_for_debug
                 blue_slot_changed = blue_slot is not None and blue_slot != previous_blue_slot
-                should_log = (
-                    VERBOSE_LOGGING
-                    or (LOG_ONLY_ON_SLOT_CHANGE and (pointer_slot_changed or blue_slot_changed))
-                    or (LOG_ONLY_ON_HIT and hit)
-                )
+                should_log = VERBOSE_LOGGING
                 if should_log:
                     status_print(
                         "Watching | "
